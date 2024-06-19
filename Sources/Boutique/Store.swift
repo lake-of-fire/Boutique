@@ -1,5 +1,5 @@
 @_exported import Bodega
-import OrderedCollections
+@_exported import OrderedCollections
 import Foundation
 
 /// A fancy persistence layer.
