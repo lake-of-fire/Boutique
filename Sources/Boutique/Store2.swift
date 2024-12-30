@@ -11,18 +11,19 @@ import OrderedCollections
 public final class Store2<Item: Codable & Sendable & Equatable> {
   public private(set) var items: [Item] = []
 
-  private let coreStore: CoreStore<Item>
+  public let core: CoreStore<Item>
+  
   private let cacheIdentifier: KeyPath<Item, String>
   private var eventTask: Task<Void, Never>?
 
   public init(storage: StorageEngine, cacheIdentifier: KeyPath<Item, String>) async throws {
     self.cacheIdentifier = cacheIdentifier
-    self.coreStore = try await CoreStore(storage: storage, cacheIdentifier: cacheIdentifier)
-    self.items = await coreStore.allItems()
+    self.core = try await CoreStore(storage: storage, cacheIdentifier: cacheIdentifier)
+    self.items = await core.allItems()
 
     // Subscribe to core store events
     self.eventTask = Task {
-      let stream = await coreStore.events()
+      let stream = await core.events()
       for await event in stream {
         applyEvent(event)
       }
@@ -42,7 +43,7 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
     // Forward write to actor
     Task {
       do {
-        try await coreStore.insert(item, firstRemovingExistingItems: strategy)
+        try await core.insert(item, firstRemovingExistingItems: strategy)
       } catch {
         // Revert changes if failed
         items = revertLocalChanges(forInsertedItems: [item], items: items)
@@ -60,7 +61,7 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
 
     Task {
       do {
-        try await coreStore.insert(itemsToInsert, firstRemovingExistingItems: strategy)
+        try await core.insert(itemsToInsert, firstRemovingExistingItems: strategy)
       } catch {
         // Revert changes if failed
         items = revertLocalChanges(forInsertedItems: itemsToInsert, items: items)
@@ -74,7 +75,7 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
 
     Task {
       do {
-        try await coreStore.remove(item)
+        try await core.remove(item)
       } catch {
         // Revert using intelligent revert method
         items = revertLocalChanges(forRemovedItems: [item], currentItems: items)
@@ -87,7 +88,7 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
 
     Task {
       do {
-        try await coreStore.remove(itemsToRemove)
+        try await core.remove(itemsToRemove)
       } catch {
         // Revert using intelligent revert method
         items = revertLocalChanges(forRemovedItems: itemsToRemove, currentItems: items)
@@ -101,7 +102,7 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
 
     Task {
       do {
-        try await coreStore.removeAll()
+        try await core.removeAll()
       } catch {
         // Revert if fails
         items = revertLocalChanges(forRemovedItems: previousItems, currentItems: items)
@@ -151,7 +152,7 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
   }
 
   /// If insertion fails, try to revert the inserted items.
-  /// In a more advanced scenario, you might want to fetch the authoritative state from `coreStore`.
+  /// In a more advanced scenario, you might want to fetch the authoritative state from `core`.
   private func revertLocalChanges(forInsertedItems insertedItems: [Item], items: [Item]) -> [Item] {
     let keys = Set(insertedItems.map { $0[keyPath: cacheIdentifier] })
     return items.filter { !keys.contains($0[keyPath: cacheIdentifier]) }
