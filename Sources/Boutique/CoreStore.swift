@@ -16,7 +16,7 @@ public actor CoreStore<Item: Codable & Sendable> {
     self.storageEngine = storage
     self.cacheIdentifier = cacheIdentifier
 
-    let storedData = try await storageEngine.readAllData()
+    let storedData = await storageEngine.readAllData()
     let loadedItems = try storedData.map { try JSONCoders.decoder.decode(Item.self, from: $0) }
 
     // Build dictionary from loaded items
@@ -62,7 +62,7 @@ public actor CoreStore<Item: Codable & Sendable> {
   // Core remove functions
   public func remove(_ items: [Item]) async throws {
     let keys = items.map { $0[keyPath: cacheIdentifier] }
-    let cacheKeys = keys.map(CacheKey.init)
+    let cacheKeys = keys.map { CacheKey($0) }
     try await storageEngine.remove(keys: cacheKeys)
     for key in keys {
       itemsDictionary.removeValue(forKey: key)
