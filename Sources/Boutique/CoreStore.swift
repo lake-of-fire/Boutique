@@ -34,6 +34,12 @@ public actor CoreStore<Item: Codable & Sendable> {
     }
   }
 
+  public var items: [Item] {
+    get async {
+      Array(itemsDictionary.values)
+    }
+  }
+
   // Core insert functions
   public func insert(_ items: [Item], firstRemovingExistingItems strategy: StoreItemRemovalStrategy<Item>? = nil) async throws {
     if let strategy = strategy {
@@ -80,10 +86,6 @@ public actor CoreStore<Item: Codable & Sendable> {
     let oldItems = Array(itemsDictionary.values)
     itemsDictionary.removeAll()
     emit(.remove(oldItems))
-  }
-
-  public func allItems() async -> [Item] {
-    Array(itemsDictionary.values)
   }
 
   private func emit(_ event: StoreEvent<Item>) {

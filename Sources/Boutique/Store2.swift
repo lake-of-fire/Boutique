@@ -16,10 +16,54 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
   private let cacheIdentifier: KeyPath<Item, String>
   private var eventTask: Task<Void, Never>?
 
+  // MARK: - Non-isolated Async API
+  
+  /// Asynchronously read all items from the core store.
+  /// This is non-isolated and can be called from any context.
+  nonisolated public var asyncItems: [Item] {
+    get async {
+      await core.items
+    }
+  }
+  
+  /// Asynchronously insert an item into the core store.
+  /// This is non-isolated and can be called from any context.
+  nonisolated public func asyncInsert(_ item: Item, firstRemovingExistingItems strategy: StoreItemRemovalStrategy<Item>? = nil) async throws {
+    try await core.insert(item, firstRemovingExistingItems: strategy)
+  }
+  
+  /// Asynchronously insert multiple items into the core store.
+  /// This is non-isolated and can be called from any context.
+  nonisolated public func asyncInsert(_ items: [Item], firstRemovingExistingItems strategy: StoreItemRemovalStrategy<Item>? = nil) async throws {
+    try await core.insert(items, firstRemovingExistingItems: strategy)
+  }
+  
+  /// Asynchronously remove an item from the core store.
+  /// This is non-isolated and can be called from any context.
+  nonisolated public func asyncRemove(_ item: Item) async throws {
+    try await core.remove(item)
+  }
+  
+  /// Asynchronously remove multiple items from the core store.
+  /// This is non-isolated and can be called from any context.
+  nonisolated public func asyncRemove(_ items: [Item]) async throws {
+    try await core.remove(items)
+  }
+  
+  /// Asynchronously remove all items from the core store.
+  /// This is non-isolated and can be called from any context.
+  nonisolated public func asyncRemoveAll() async throws {
+    try await core.removeAll()
+  }
+
+  nonisolated public func asyncEvents() async -> AsyncStream<StoreEvent<Item>> {
+    await core.events()
+  }
+
   public init(storage: StorageEngine, cacheIdentifier: KeyPath<Item, String>) async throws {
     self.cacheIdentifier = cacheIdentifier
     self.core = try await CoreStore(storage: storage, cacheIdentifier: cacheIdentifier)
-    self.items = await core.allItems()
+    self.items = await core.items
 
     // Subscribe to core store events
     self.eventTask = Task {
@@ -133,9 +177,15 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
 
   /// Insert or update items in the local array.
   private func upsertLocal(items: [Item], newItems: [Item]) -> [Item] {
-    var dictionary = Dictionary(
-      uniqueKeysWithValues: items.map { ($0[keyPath: cacheIdentifier], $0) })
+    // Create dictionary preserving order of existing items
+    var dictionary = OrderedDictionary(
+      uniqueKeys: items.map { $0[keyPath: cacheIdentifier] },
+      values: items
+    )
+    // Append new items in order they were provided, just like CoreStore
     for item in newItems {
+      // If key exists, this updates in place preserving position
+      // If key is new, appends to end like CoreStore
       dictionary[item[keyPath: cacheIdentifier]] = item
     }
     return Array(dictionary.values)
@@ -147,15 +197,31 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
 
   /// Remove items from the local array.
   private func removeLocal(items: [Item], itemsToRemove: [Item]) -> [Item] {
-    let keysToRemove = Set(itemsToRemove.map { $0[keyPath: cacheIdentifier] })
-    return items.filter { !keysToRemove.contains($0[keyPath: cacheIdentifier]) }
+    // Create dictionary preserving order of existing items
+    var dictionary = OrderedDictionary(
+      uniqueKeys: items.map { $0[keyPath: cacheIdentifier] },
+      values: items
+    )
+    // Remove items while maintaining relative positions of remaining items
+    for item in itemsToRemove {
+      dictionary.removeValue(forKey: item[keyPath: cacheIdentifier])
+    }
+    return Array(dictionary.values)
   }
 
   /// If insertion fails, try to revert the inserted items.
   /// In a more advanced scenario, you might want to fetch the authoritative state from `core`.
   private func revertLocalChanges(forInsertedItems insertedItems: [Item], items: [Item]) -> [Item] {
-    let keys = Set(insertedItems.map { $0[keyPath: cacheIdentifier] })
-    return items.filter { !keys.contains($0[keyPath: cacheIdentifier]) }
+    // Create dictionary preserving order of existing items
+    var dictionary = OrderedDictionary(
+      uniqueKeys: items.map { $0[keyPath: cacheIdentifier] },
+      values: items
+    )
+    // Remove items while maintaining relative positions
+    for item in insertedItems {
+      dictionary.removeValue(forKey: item[keyPath: cacheIdentifier])
+    }
+    return Array(dictionary.values)
   }
 
   /// If removal fails, reinsert the removed items into the current items array
