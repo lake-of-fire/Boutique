@@ -6,11 +6,13 @@ public actor CoreStore<Item: Codable & Sendable> {
   private let storageEngine: StorageEngine
   private let cacheIdentifier: KeyPath<Item, String>
   private var itemsDictionary: OrderedDictionary<String, Item> = [:]
+  private var isBatching = false
+  private var batchedEvents: [StoreEvent<Item>] = []
 
   // A subject-like mechanism for broadcasting events:
   // Each new AsyncStream created from `events()` will pick up any new events.
   // Note: AsyncStream provides a mechanism to handle multiple subscribers easily.
-  private var eventContinuations = [AsyncStream<StoreEvent<Item>>.Continuation]()
+  private var eventContinuations = [AsyncStream<[StoreEvent<Item>]>.Continuation]()
 
   public init(storage: StorageEngine, cacheIdentifier: KeyPath<Item, String>) async throws {
     self.storageEngine = storage
@@ -26,11 +28,34 @@ public actor CoreStore<Item: Codable & Sendable> {
     )
   }
 
-  public func events() -> AsyncStream<StoreEvent<Item>> {
+  /// Start a batch of operations that will be emitted as a single event
+  public func beginBatch() {
+    isBatching = true
+    batchedEvents = []
+  }
+
+  /// End the current batch and emit all operations as a single event
+  public func endBatch() {
+    guard isBatching else { return }
+    isBatching = false
+    
+    if !batchedEvents.isEmpty {
+      emit(batchedEvents)
+    }
+    batchedEvents = []
+  }
+
+  public func batch(_ operations: () async throws -> Void) async throws {
+    beginBatch()
+    try await operations()
+    endBatch()
+  }
+
+  public func events() -> AsyncStream<[StoreEvent<Item>]> {
     AsyncStream { continuation in
       eventContinuations.append(continuation)
       // Emit initial loaded event:
-      continuation.yield(.loaded(Array(itemsDictionary.values)))
+      continuation.yield([.loaded(Array(itemsDictionary.values))])
     }
   }
 
@@ -58,7 +83,11 @@ public actor CoreStore<Item: Codable & Sendable> {
     }
     try await storageEngine.write(dataAndKeys)
 
-    emit(.insert(items))
+    if isBatching {
+      batchedEvents.append(.insert(items))
+    } else {
+      emit(.insert(items))
+    }
   }
 
   public func insert(_ item: Item, firstRemovingExistingItems strategy: StoreItemRemovalStrategy<Item>? = nil) async throws {
@@ -74,7 +103,11 @@ public actor CoreStore<Item: Codable & Sendable> {
       itemsDictionary.removeValue(forKey: key)
     }
 
-    emit(.remove(items))
+    if isBatching {
+      batchedEvents.append(.remove(items))
+    } else {
+      emit(.remove(items))
+    }
   }
 
   public func remove(_ item: Item) async throws {
@@ -85,12 +118,21 @@ public actor CoreStore<Item: Codable & Sendable> {
     try await storageEngine.removeAllData()
     let oldItems = Array(itemsDictionary.values)
     itemsDictionary.removeAll()
-    emit(.remove(oldItems))
+    
+    if isBatching {
+      batchedEvents.append(.remove(oldItems))
+    } else {
+      emit(.remove(oldItems))
+    }
   }
 
   private func emit(_ event: StoreEvent<Item>) {
+    emit([event])
+  }
+
+  private func emit(_ events: [StoreEvent<Item>]) {
     for continuation in eventContinuations {
-      continuation.yield(event)
+      continuation.yield(events)
     }
   }
 }

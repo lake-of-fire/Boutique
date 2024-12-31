@@ -26,6 +26,26 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
     }
   }
   
+  /// Start a batch of operations that will be emitted as a single event.
+  /// Must be paired with a call to `asyncEndBatch()`.
+  /// This allows multiple operations to be combined into a single update event.
+  nonisolated public func asyncBeginBatch() async {
+    await core.beginBatch()
+  }
+  
+  /// End the current batch and emit all operations as a single event.
+  nonisolated public func asyncEndBatch() async {
+    await core.endBatch()
+  }
+  
+  /// Execute multiple operations in a batch, emitting only a single event.
+  /// - Parameter operations: An async closure that performs multiple core store operations
+  nonisolated public func asyncBatch(_ operations: () async throws -> Void) async throws {
+    await asyncBeginBatch()
+    try await operations()
+    await asyncEndBatch()
+  }
+  
   /// Asynchronously insert an item into the core store.
   /// This is non-isolated and can be called from any context.
   nonisolated public func asyncInsert(_ item: Item, firstRemovingExistingItems strategy: StoreItemRemovalStrategy<Item>? = nil) async throws {
@@ -56,7 +76,7 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
     try await core.removeAll()
   }
 
-  nonisolated public func asyncEvents() async -> AsyncStream<StoreEvent<Item>> {
+  nonisolated public func asyncEvents() async -> AsyncStream<[StoreEvent<Item>]> {
     await core.events()
   }
 
@@ -68,108 +88,201 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
     // Subscribe to core store events
     self.eventTask = Task {
       let stream = await core.events()
-      for await event in stream {
-        applyEvent(event)
+      for await events in stream {
+        applyEvents(events)
       }
     }
+  }
+
+  // MARK: - Main-Actor Batching
+
+  /// Represents the state of a batch operation
+  private struct BatchState {
+    var items: [Item]
+    var operations: [() async throws -> Void]
+    var previousItems: [Item] // For rollback
+  }
+  
+  private var currentBatch: BatchState?
+  private var batchDepth = 0
+
+  /// Start a batch of operations.
+  /// - Batches can be nested, with changes only being applied when the outermost batch completes
+  /// - All operations within the batch are treated as a single transaction
+  /// - The UI will only update once when the entire batch succeeds
+  public func beginBatch() {
+    batchDepth += 1
+    // Only create new batch state for the outermost batch
+    if batchDepth == 1 {
+      currentBatch = BatchState(
+        items: items,
+        operations: [],
+        previousItems: items
+      )
+    }
+  }
+
+  /// End the current batch and apply all changes if this is the outermost batch.
+  /// - If any operation fails, all changes are reverted
+  public func endBatch() {
+    guard batchDepth > 0 else { return }
+    batchDepth -= 1
+    
+    // Only process the batch when we're ending the outermost batch
+    guard batchDepth == 0, let batch = currentBatch else { return }
+    
+    // Create task for async work
+    Task(priority: .userInitiated) { [weak self, batch] in
+      guard let self = self else { return }
+      
+      do {
+        // Start core store batch
+        await core.beginBatch()
+        
+        // Execute all operations
+        for operation in batch.operations {
+          try await operation()
+        }
+        
+        // Complete core store batch
+        await core.endBatch()
+        
+      } catch {
+        // On any error, revert to previous state
+        await MainActor.run { [batch] in
+          self.items = batch.previousItems
+        }
+        
+        // End core store batch
+        await core.endBatch()
+      }
+    }
+    
+    // Clear batch state
+    currentBatch = nil
+  }
+
+  /// Execute operations in a batch synchronously.
+  /// - Parameter operations: A closure containing the operations to batch
+  public func batch(_ operations: () -> Void) {
+    beginBatch()
+    operations()
+    endBatch()
   }
 
   // MARK: - Main-Actor Writes (Optimistic UI Updates)
 
-  public func insert(_ item: Item, firstRemovingExistingItems strategy: StoreItemRemovalStrategy<Item>? = nil) {
-    // Optimistically update UI
-    if let strategy = strategy {
-      let itemsToRemove = strategy.removedItems([item])
-      items = removeLocal(items: items, itemsToRemove: itemsToRemove)
-    }
-    items = upsertLocal(items: items, newItem: item)
-
-    // Forward write to actor
-    Task {
-      do {
-        try await core.insert(item, firstRemovingExistingItems: strategy)
-      } catch {
-        // Revert changes if failed
-        items = revertLocalChanges(forInsertedItems: [item], items: items)
+  private func updateState(
+    _ update: (inout [Item]) -> Void,
+    operation: @escaping () async throws -> Void,
+    rollback: @escaping ([Item]) -> [Item]
+  ) {
+    if var batch = currentBatch {
+      // Update batch state
+      update(&batch.items)
+      batch.operations.append(operation)
+      currentBatch = batch
+    } else {
+      // Immediate update
+      update(&items)
+      
+      Task(priority: .userInitiated) {
+        do {
+          try await operation()
+        } catch {
+          // Use specialized rollback function to revert only the failed changes
+          await MainActor.run {
+            self.items = rollback(self.items)
+          }
+        }
       }
     }
+  }
+
+  public func insert(_ item: Item, firstRemovingExistingItems strategy: StoreItemRemovalStrategy<Item>? = nil) {
+    updateState({ items in
+      if let strategy = strategy {
+        let itemsToRemove = strategy.removedItems([item])
+        items = removeLocal(items: items, itemsToRemove: itemsToRemove)
+      }
+      items = upsertLocal(items: items, newItem: item)
+    }, operation: { [core, item, strategy] in
+      try await core.insert(item, firstRemovingExistingItems: strategy)
+    }, rollback: { [weak self] items in
+      guard let self = self else { return items }
+      return self.revertLocalChanges(forInsertedItems: [item], items: items)
+    })
   }
 
   public func insert(_ itemsToInsert: [Item], firstRemovingExistingItems strategy: StoreItemRemovalStrategy<Item>? = nil) {
-    // Optimistically update UI
-    if let strategy = strategy {
-      let itemsToRemove = strategy.removedItems(itemsToInsert)
-      items = removeLocal(items: items, itemsToRemove: itemsToRemove)
-    }
-    items = upsertLocal(items: items, newItems: itemsToInsert)
-
-    Task {
-      do {
-        try await core.insert(itemsToInsert, firstRemovingExistingItems: strategy)
-      } catch {
-        // Revert changes if failed
-        items = revertLocalChanges(forInsertedItems: itemsToInsert, items: items)
+    updateState({ items in
+      if let strategy = strategy {
+        let itemsToRemove = strategy.removedItems(itemsToInsert)
+        items = removeLocal(items: items, itemsToRemove: itemsToRemove)
       }
-    }
+      items = upsertLocal(items: items, newItems: itemsToInsert)
+    }, operation: { [core, itemsToInsert, strategy] in
+      try await core.insert(itemsToInsert, firstRemovingExistingItems: strategy)
+    }, rollback: { [weak self] items in
+      guard let self = self else { return items }
+      return self.revertLocalChanges(forInsertedItems: itemsToInsert, items: items)
+    })
   }
 
   public func remove(_ item: Item) {
-    // Optimistically update UI
-    items = removeLocal(items: items, itemsToRemove: [item])
-
-    Task {
-      do {
-        try await core.remove(item)
-      } catch {
-        // Revert using intelligent revert method
-        items = revertLocalChanges(forRemovedItems: [item], currentItems: items)
-      }
-    }
+    updateState({ items in
+      items = removeLocal(items: items, itemsToRemove: [item])
+    }, operation: { [core, item] in
+      try await core.remove(item)
+    }, rollback: { [weak self] items in
+      guard let self = self else { return items }
+      return self.revertLocalChanges(forRemovedItems: [item], currentItems: items)
+    })
   }
 
   public func remove(_ itemsToRemove: [Item]) {
-    items = removeLocal(items: items, itemsToRemove: itemsToRemove)
-
-    Task {
-      do {
-        try await core.remove(itemsToRemove)
-      } catch {
-        // Revert using intelligent revert method
-        items = revertLocalChanges(forRemovedItems: itemsToRemove, currentItems: items)
-      }
-    }
+    updateState({ items in
+      items = removeLocal(items: items, itemsToRemove: itemsToRemove)
+    }, operation: { [core, itemsToRemove] in
+      try await core.remove(itemsToRemove)
+    }, rollback: { [weak self] items in
+      guard let self = self else { return items }
+      return self.revertLocalChanges(forRemovedItems: itemsToRemove, currentItems: items)
+    })
   }
 
   public func removeAll() {
     let previousItems = items
-    items.removeAll()
-
-    Task {
-      do {
-        try await core.removeAll()
-      } catch {
-        // Revert if fails
-        items = revertLocalChanges(forRemovedItems: previousItems, currentItems: items)
-      }
-    }
+    updateState({ items in
+      items.removeAll()
+    }, operation: { [core] in
+      try await core.removeAll()
+    }, rollback: { [weak self] items in
+      guard let self = self else { return items }
+      return self.revertLocalChanges(forRemovedItems: previousItems, currentItems: items)
+    })
   }
 
   // MARK: - Private Helpers
 
-  private func applyEvent(_ event: StoreEvent<Item>) {
+  private func applyEvents(_ events: [StoreEvent<Item>]) {
     let previousItems = items
     var newItems = previousItems
-    switch event {
-    case .initial:
-      // If needed, handle an initial state event
-      break
-    case .loaded(let loadedItems):
-      newItems = loadedItems
-    case .insert(let insertedItems):
-      newItems = upsertLocal(items: previousItems, newItems: insertedItems)
-    case .remove(let removedItems):
-      newItems = removeLocal(items: previousItems, itemsToRemove: removedItems)
+    
+    for event in events {
+      switch event {
+      case .initial:
+        // If needed, handle an initial state event
+        break
+      case .loaded(let loadedItems):
+        newItems = loadedItems
+      case .insert(let insertedItems):
+        newItems = upsertLocal(items: newItems, newItems: insertedItems)
+      case .remove(let removedItems):
+        newItems = removeLocal(items: newItems, itemsToRemove: removedItems)
+      }
     }
+    
     if newItems != previousItems {
       items = newItems
     }
