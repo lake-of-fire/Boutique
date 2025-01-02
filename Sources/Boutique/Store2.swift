@@ -9,7 +9,11 @@ import OrderedCollections
 @MainActor
 @Observable
 public final class Store2<Item: Codable & Sendable & Equatable> {
-  public private(set) var items: [Item] = []
+  public private(set) var items: [Item] = [] {
+    didSet {
+      notifyItemsChanged()
+    }
+  }
 
   public let core: CoreStore<Item>
   
@@ -79,6 +83,24 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
   nonisolated public func asyncEvents() async -> AsyncStream<[StoreEvent<Item>]> {
     await core.events()
   }
+
+  public func itemsStream() -> AsyncStream<[Item]> {
+    AsyncStream { continuation in
+      let box = ContinuationBox(continuation)
+      itemsContinuations.append(box)
+
+      continuation.yield(items)
+
+      continuation.onTermination = { [weak self] _ in
+        guard let self = self else { return }
+        Task { @MainActor in
+          self.itemsContinuations.removeAll { $0 === box }
+        }
+      }
+    }
+  }
+
+  private var itemsContinuations: [ContinuationBox<Item>] = []
 
   public init(storage: StorageEngine, cacheIdentifier: KeyPath<Item, String>) async throws {
     self.cacheIdentifier = cacheIdentifier
@@ -342,5 +364,19 @@ public final class Store2<Item: Codable & Sendable & Equatable> {
   private func revertLocalChanges(forRemovedItems removedItems: [Item], currentItems: [Item]) -> [Item] {
     // Use the existing upsert logic to reinsert the items
     return upsertLocal(items: currentItems, newItems: removedItems)
+  }
+
+  private func notifyItemsChanged() {
+    for box in itemsContinuations {
+      box.continuation.yield(items)
+    }
+  }
+}
+
+private final class ContinuationBox<Item: Equatable> {
+  let continuation: AsyncStream<[Item]>.Continuation
+
+  init(_ continuation: AsyncStream<[Item]>.Continuation) {
+    self.continuation = continuation
   }
 }
