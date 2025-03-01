@@ -6,8 +6,8 @@ import PackageDescription
 let package = Package(
     name: "Boutique",
     platforms: [
-        .iOS(.v17),
-        .macOS(.v14),
+        .iOS(.v15),
+        .macOS(.v13),
     ],
     products: [
         .library(
@@ -24,7 +24,7 @@ let package = Package(
             name: "Boutique",
             dependencies: [
                 .byName(name: "Bodega"),
-                .product(name: "OrderedCollections", package: "swift-collections")
+                .product(name: "OrderedCollections", package: "swift-collections"),
             ],
             exclude: [
                 "../../Images",

@@ -7,7 +7,6 @@ import OrderedCollections
 /// - Asynchronously synchronizes with the CoreStore.
 /// - Merges background updates into its main-thread copy of items.
 @MainActor
-@Observable
 public final class Store2<Item: Codable & Sendable & Equatable> {
   public private(set) var items: [Item] = [] {
     didSet {
